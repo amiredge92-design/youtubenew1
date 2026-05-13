@@ -1,0 +1,399 @@
+name: 07- 🎵 Spotify Playlist Downloader (Complete)
+
+on:
+  workflow_dispatch:
+    inputs:
+      spotify_url:
+        description: 'Spotify Playlist, Album, or Track URL'
+        required: true
+        type: string
+      output_format:
+        description: 'Output format (mp3, m4a, flac, opus, wav)'
+        required: false
+        default: 'mp3'
+        type: string
+      password:
+        description: 'Password for zip files (optional)'
+        required: false
+        default: ''
+        type: string
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  download-spotify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Configure Git for Large Files
+        run: |
+          git config --global http.postBuffer 524288000
+          git config --global http.maxRequestBuffer 100M
+          git config --global core.compression 0
+          git config --global pack.windowMemory 256m
+          git config --global pack.packSizeLimit 100m
+          git config --global pack.threads 1
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip ffmpeg zip curl jq bc unzip
+          pip3 install --break-system-packages --upgrade spotdl yt-dlp
+
+      - name: Download Spotify Playlist
+        run: |
+          SPOTIFY_URL="${{ github.event.inputs.spotify_url }}"
+          OUTPUT_FORMAT="${{ github.event.inputs.output_format }}"
+          ZIP_PASSWORD="${{ github.event.inputs.password }}"
+
+          SPLIT_MB=45
+          SPLIT_BYTES=$(( SPLIT_MB * 1024 * 1024 ))
+
+          BACKUP_DIR="/tmp/music_backup_$$"
+          mkdir -p "$BACKUP_DIR"
+          echo "$BACKUP_DIR" > /tmp/backup_dir_path.txt
+
+          mkdir -p music tmp_downloads
+
+          echo "=========================================="
+          echo "🎵 Spotify Playlist Downloader"
+          echo "https://avasam.ir"
+          echo "=========================================="
+          echo ""
+          echo "Downloading from: $SPOTIFY_URL"
+          echo "Output format: $OUTPUT_FORMAT"
+          echo ""
+
+          sanitize_name() {
+            echo "$1" | sed 's/ /-/g' | sed 's/　/-/g' | tr -s '-'
+          }
+
+          urlencode() {
+            python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
+          }
+
+          # ============================================
+          # دانلود با spotDL (پشتیبانی از پلی‌لیست)
+          # ============================================
+          spotdl "$SPOTIFY_URL" \
+            --format "$OUTPUT_FORMAT" \
+            --output "tmp_downloads/{artist} - {title}.{output-ext}" \
+            --threads 4 \
+            --retry 3
+
+          if [ $? -ne 0 ]; then
+            echo ""
+            echo "❌ Download failed!"
+            echo "Possible reasons:"
+            echo "1. Invalid playlist URL"
+            echo "2. No internet connection"
+            echo "3. Spotify API rate limit"
+            exit 1
+          fi
+
+          # حذف فایل‌های اضافی spotDL
+          find tmp_downloads -name "*.part" -delete 2>/dev/null
+          find tmp_downloads -name "*.temp" -delete 2>/dev/null
+
+          if [ -z "$(ls -A tmp_downloads 2>/dev/null)" ]; then
+            echo "❌ No files downloaded!"
+            exit 1
+          fi
+
+          echo ""
+          echo "✅ Download successful!"
+          echo "Files downloaded:"
+          ls -la tmp_downloads/
+          echo ""
+
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          BRANCH="${GITHUB_REF_NAME}"
+
+          RANDOM_WORDS=("alpha" "beta" "gamma" "delta" "epsilon" "zeta" "eta" "theta" "kappa" "lambda" "sigma" "omega" "nova" "star" "moon" "sun")
+
+          get_random_word() { echo "${RANDOM_WORDS[$RANDOM % ${#RANDOM_WORDS[@]}]}_$RANDOM"; }
+
+          # ============================================
+          # پردازش و دسته‌بندی فایل‌ها
+          # ============================================
+          > /tmp/music_info.txt
+          FILE_INDEX=0
+
+          for FILE in tmp_downloads/*; do
+            [ -f "$FILE" ] || continue
+            SIZE=$(stat -c%s "$FILE")
+            BASENAME=$(basename "$FILE")
+            FILENAME_NO_EXT="${BASENAME%.*}"
+            EXT="${BASENAME##*.}"
+            FILE_INDEX=$((FILE_INDEX + 1))
+
+            FILENAME_NO_EXT=$(sanitize_name "$FILENAME_NO_EXT")
+
+            echo "Processing: $BASENAME ($(( SIZE / 1024 / 1024 ))MB)"
+
+            # ایجاد پوشه مجزا برای هر آهنگ
+            FINAL_FOLDER_NAME="$FILENAME_NO_EXT"
+            
+            # اگر پوشه تکراری بود، عدد اضافه کن
+            if [ -d "$BACKUP_DIR/${FINAL_FOLDER_NAME}" ]; then
+              RANDOM_SUFFIX=$(get_random_word)
+              FINAL_FOLDER_NAME="${FILENAME_NO_EXT}_${RANDOM_SUFFIX}"
+            fi
+
+            mkdir -p "$BACKUP_DIR/${FINAL_FOLDER_NAME}"
+            echo "Created folder: ${FINAL_FOLDER_NAME}"
+
+            echo "${FILENAME_NO_EXT}|${FINAL_FOLDER_NAME}" >> /tmp/music_info.txt
+
+            TEMP_NAME="music_${FILE_INDEX}"
+            FOLDER_ENCODED=$(urlencode "${FINAL_FOLDER_NAME}")
+
+            if [ "$SIZE" -gt "$SPLIT_BYTES" ]; then
+              echo "Splitting into ${SPLIT_MB}MB parts..."
+              cp "$FILE" "tmp_downloads/${TEMP_NAME}.${EXT}"
+              cd tmp_downloads
+              if [ -n "$ZIP_PASSWORD" ]; then
+                zip -0 -s "${SPLIT_MB}m" -P "$ZIP_PASSWORD" "${TEMP_NAME}.zip" "${TEMP_NAME}.${EXT}" 2>/dev/null
+              else
+                zip -0 -s "${SPLIT_MB}m" "${TEMP_NAME}.zip" "${TEMP_NAME}.${EXT}" 2>/dev/null
+              fi
+              for part in ${TEMP_NAME}.z[0-9]* ${TEMP_NAME}.zip; do
+                if [ -f "$part" ]; then
+                  PART_EXT="${part##*.}"
+                  mv "$part" "$BACKUP_DIR/${FINAL_FOLDER_NAME}/${FINAL_FOLDER_NAME}.${PART_EXT}"
+                  echo "  Created: ${FINAL_FOLDER_NAME}.${PART_EXT}"
+                fi
+              done
+              rm -f "${TEMP_NAME}.${EXT}"
+              cd ..
+
+              PART_COUNT=$(ls "$BACKUP_DIR/${FINAL_FOLDER_NAME}/"*.z* 2>/dev/null | wc -l)
+              TOTAL_SIZE=0
+              for part_file in "$BACKUP_DIR/${FINAL_FOLDER_NAME}"/*; do
+                if [ -f "$part_file" ]; then
+                  PART_SIZE=$(stat -c%s "$part_file")
+                  TOTAL_SIZE=$((TOTAL_SIZE + PART_SIZE))
+                fi
+              done
+              TOTAL_SIZE_MB=$(echo "scale=2; $TOTAL_SIZE / 1024 / 1024" | bc)
+
+              DOWNLOAD_LINKS_MD=""
+              LINK_NUM=0
+              for part_file in "$BACKUP_DIR/${FINAL_FOLDER_NAME}"/*.z*; do
+                if [ -f "$part_file" ]; then
+                  PART_BASENAME=$(basename "$part_file")
+                  PART_ENCODED=$(urlencode "${PART_BASENAME}")
+                  RAW_LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/music/${FOLDER_ENCODED}/${PART_ENCODED}"
+                  LINK_NUM=$((LINK_NUM + 1))
+                  DOWNLOAD_LINKS_MD="${DOWNLOAD_LINKS_MD}| ${LINK_NUM} | \`${PART_BASENAME}\` | [Download](${RAW_LINK}) |"$'\n'
+                fi
+              done
+
+              README_FILE="$BACKUP_DIR/${FINAL_FOLDER_NAME}/README.md"
+              {
+                printf '%s\n' "# ${FILENAME_NO_EXT}"
+                printf '%s\n' ""
+                printf '%s\n' "---"
+                printf '%s\n' ""
+                printf '%s\n' "## Music Information"
+                printf '%s\n' ""
+                printf '%s\n' "| Property | Value |"
+                printf '%s\n' "|----------|-------|"
+                printf '%s\n' "| **Track Name** | \`${FILENAME_NO_EXT}\` |"
+                printf '%s\n' "| **Source** | [Spotify](${SPOTIFY_URL}) |"
+                printf '%s\n' "| **Total Size** | **${PART_COUNT} zip parts** - **${TOTAL_SIZE_MB} MB** |"
+                printf '%s\n' "| **Format** | **${OUTPUT_FORMAT}** |"
+                printf '%s\n' "| **Status** | **Complete (100%)** |"
+                if [ -n "$ZIP_PASSWORD" ]; then
+                  printf '%s\n' "| **Password Protected** | **YES** |"
+                else
+                  printf '%s\n' "| **Password Protected** | **NO** |"
+                fi
+                printf '%s\n' ""
+                printf '%s\n' "---"
+                printf '%s\n' ""
+                printf '%s\n' "## Download Links"
+                printf '%s\n' ""
+                printf '%s\n' "| # | File | Link |"
+                printf '%s\n' "|---|------|------|"
+                printf '%s' "${DOWNLOAD_LINKS_MD}"
+                printf '%s\n' ""
+                printf '%s\n' "---"
+                printf '%s\n' ""
+                printf '%s\n' "## How to Extract"
+                printf '%s\n' ""
+                printf '%s\n' "1. **Download** all \`.zip\` and \`.z01\`, \`.z02\`... files"
+                printf '%s\n' "2. **Extract** using [7-Zip](https://www.7-zip.org/) or [WinRAR](https://www.rarlab.com/)"
+                printf '%s\n' "3. The music file will be extracted"
+                printf '%s\n' ""
+                printf '%s\n' "---"
+                printf '%s\n' ""
+                printf '%s\n' "*Powered by [AVASAM](https://avasam.ir)*"
+              } > "$README_FILE"
+              echo "Created README.md"
+
+            else
+              if [ -n "$ZIP_PASSWORD" ]; then
+                echo "Creating password-protected zip..."
+                cp "$FILE" "tmp_downloads/${TEMP_NAME}.${EXT}"
+                cd tmp_downloads
+                zip -j -P "$ZIP_PASSWORD" "${TEMP_NAME}.zip" "${TEMP_NAME}.${EXT}" 2>/dev/null
+                mv "${TEMP_NAME}.zip" "$BACKUP_DIR/${FINAL_FOLDER_NAME}/${FINAL_FOLDER_NAME}.zip"
+                rm -f "${TEMP_NAME}.${EXT}"
+                cd ..
+              else
+                echo "Copying music file..."
+                cp "$FILE" "$BACKUP_DIR/${FINAL_FOLDER_NAME}/${FINAL_FOLDER_NAME}.${EXT}"
+              fi
+
+              SIZE_MB=$(echo "scale=2; $SIZE / 1024 / 1024" | bc)
+
+              if [ -n "$ZIP_PASSWORD" ]; then
+                FILE_ENCODED=$(urlencode "${FINAL_FOLDER_NAME}.zip")
+                RAW_LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/music/${FOLDER_ENCODED}/${FILE_ENCODED}"
+              else
+                FILE_ENCODED=$(urlencode "${FINAL_FOLDER_NAME}.${EXT}")
+                RAW_LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/music/${FOLDER_ENCODED}/${FILE_ENCODED}"
+              fi
+
+              README_FILE="$BACKUP_DIR/${FINAL_FOLDER_NAME}/README.md"
+              {
+                printf '%s\n' "# ${FILENAME_NO_EXT}"
+                printf '%s\n' ""
+                printf '%s\n' "---"
+                printf '%s\n' ""
+                printf '%s\n' "## Music Information"
+                printf '%s\n' ""
+                printf '%s\n' "| Property | Value |"
+                printf '%s\n' "|----------|-------|"
+                printf '%s\n' "| **Track Name** | \`${FILENAME_NO_EXT}\` |"
+                printf '%s\n' "| **Source** | [Spotify](${SPOTIFY_URL}) |"
+                printf '%s\n' "| **Total Size** | **1 file** - **${SIZE_MB} MB** |"
+                printf '%s\n' "| **Format** | **${OUTPUT_FORMAT}** |"
+                printf '%s\n' "| **Status** | **Complete (100%)** |"
+                if [ -n "$ZIP_PASSWORD" ]; then
+                  printf '%s\n' "| **Password Protected** | **YES** |"
+                else
+                  printf '%s\n' "| **Password Protected** | **NO** |"
+                fi
+                printf '%s\n' ""
+                printf '%s\n' "---"
+                printf '%s\n' ""
+                printf '%s\n' "## Download Link"
+                printf '%s\n' ""
+                printf '%s\n' "| # | File | Link |"
+                printf '%s\n' "|---|------|------|"
+                printf '%s\n' "| 1 | \`$(basename "$RAW_LINK")\` | [Download](${RAW_LINK}) |"
+                printf '%s\n' ""
+                printf '%s\n' "---"
+                printf '%s\n' ""
+                if [ -z "$ZIP_PASSWORD" ]; then
+                  printf '%s\n' "✅ Ready to use - no extraction needed!"
+                  printf '%s\n' ""
+                fi
+                printf '%s\n' "---"
+                printf '%s\n' ""
+                printf '%s\n' "*Powered by [AVASAM](https://avasam.ir)*"
+              } > "$README_FILE"
+              echo "Created README.md"
+            fi
+          done
+
+          rm -rf tmp_downloads
+          echo ""
+          echo "===== Backup folder contents ====="
+          find "$BACKUP_DIR" -type f | head -30
+
+      - name: Commit & Push
+        run: |
+          BRANCH="${GITHUB_REF_NAME}"
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          BACKUP_DIR=$(cat /tmp/backup_dir_path.txt)
+
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          echo "=========================================="
+          echo "Pushing files to GitHub..."
+          echo "=========================================="
+
+          git fetch origin "$BRANCH"
+          git reset --hard origin/"$BRANCH"
+          
+          mkdir -p music
+          cp -r "$BACKUP_DIR"/* music/ 2>/dev/null || true
+
+          # ساخت README اصلی برای موزیک
+          MASTER_README="music/README.md"
+          {
+            echo "# 🎵 SPOTIFY DOWNLOADED MUSIC"
+            echo ""
+            echo "---"
+            echo ""
+            echo "| # | Track | Size | Format |"
+            echo "|---|-------|------|--------|"
+          } > "$MASTER_README"
+
+          NUM=0
+          for folder in music/*/; do
+            [ -d "$folder" ] || continue
+            FOLDER_NAME=$(basename "$folder")
+            [ -f "$folder/README.md" ] || continue
+            
+            # استخراج اطلاعات از README
+            TRACK_SIZE=$(grep -i "Total Size" "$folder/README.md" | head -1 | sed 's/|.*Total Size.*|//' | sed 's/|.*//' | tr -d ' ')
+            TRACK_FORMAT=$(grep -i "Format" "$folder/README.md" | head -1 | sed 's/|.*Format.*|//' | sed 's/|.*//' | tr -d ' ')
+            
+            NUM=$((NUM + 1))
+            FOLDER_ENCODED=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$FOLDER_NAME")
+            FOLDER_LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/tree/${BRANCH}/music/${FOLDER_ENCODED}"
+            
+            echo "| $NUM | [$FOLDER_NAME]($FOLDER_LINK) | $TRACK_SIZE | $TRACK_FORMAT |" >> "$MASTER_README"
+          done
+
+          git add -A music/
+          
+          if ! git diff --cached --quiet; then
+            git commit -m "[AVASAM] Spotify playlist download [skip ci]"
+            
+            for i in {1..10}; do
+              if git push origin HEAD:"$BRANCH" 2>&1; then
+                echo ""
+                echo "=========================================="
+                echo "✅ PUSH SUCCESSFUL!"
+                echo "=========================================="
+                break
+              else
+                echo "Push attempt $i/10 failed, retrying..."
+                sleep $((3 + i))
+                git fetch origin "$BRANCH"
+                git reset --hard origin/"$BRANCH"
+                mkdir -p music
+                cp -r "$BACKUP_DIR"/* music/ 2>/dev/null || true
+                git add -A music/
+                git commit -m "[AVASAM] Spotify playlist download [skip ci]"
+              fi
+            done
+          else
+            echo "No new files to commit"
+          fi
+
+          echo ""
+          echo "=========================================="
+          echo "✅ ALL TRACKS DOWNLOADED AND PUSHED!"
+          echo "https://avasam.ir"
+          echo "=========================================="
